@@ -125,6 +125,11 @@ class RolloutStorage:
         self.step = 0
 
     def compute_returns(self, last_values, gamma, lam, normalize_advantage: bool = True):
+        """Compute GAE-lambda advantages and bootstrapped returns for PPO.
+
+        GAE uses an exponentially weighted sum of temporal-difference residuals:
+        A_t = delta_t + gamma * lambda * A_{t+1}. The return target is then R_t = A_t + V_old(s_t).
+        """
         advantage = 0
         for step in reversed(range(self.num_transitions_per_env)):
             # if we are at the last step, bootstrap the return value
@@ -150,6 +155,12 @@ class RolloutStorage:
 
     # for distillation
     def generator(self):
+        """Yield time-major rollout steps for teacher-student distillation.
+
+        Each item contains observations o_t, the sampled student action a_s_t, the teacher target a_T_t stored as
+        privileged_actions, and done_t. Distillation.update() consumes these in order so recurrent students can perform
+        truncated BPTT over gradient_length steps.
+        """
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
 
@@ -162,6 +173,8 @@ class RolloutStorage:
             raise ValueError("This function is only available for reinforcement learning training.")
         batch_size = self.num_envs * self.num_transitions_per_env
         mini_batch_size = batch_size // num_mini_batches
+        # PPO performs several epochs over the same on-policy rollout. The old log-probs, values, means, and standard
+        # deviations below are fixed snapshots from rollout time and form the pi_old side of the PPO objective.
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
         # Core
@@ -197,15 +210,25 @@ class RolloutStorage:
                 old_sigma_batch = old_sigma[batch_idx]
 
                 # yield the mini-batch
-                yield obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
+                yield (
+                    obs_batch,
+                    actions_batch,
+                    target_values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    (None, None),
                     None,
-                    None,
-                ), None
+                )
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
+        # Recurrent PPO batches complete padded trajectories and masks instead of arbitrary flat transitions, so hidden
+        # states can be replayed consistently while padded timesteps are ignored by the model/loss.
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
 
         mini_batch_size = self.num_envs // num_mini_batches
@@ -232,7 +255,8 @@ class RolloutStorage:
                 values_batch = self.values[:, start:stop]
                 old_actions_log_prob_batch = self.actions_log_prob[:, start:stop]
 
-                # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
+                # reshape to [num_envs, time, num layers, hidden dim]
+                # (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
                 last_was_done = last_was_done.permute(1, 0)
@@ -252,9 +276,17 @@ class RolloutStorage:
                 hid_a_batch = hid_a_batch[0] if len(hid_a_batch) == 1 else hid_a_batch
                 hid_c_batch = hid_c_batch[0] if len(hid_c_batch) == 1 else hid_c_batch
 
-                yield obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
-                    hid_a_batch,
-                    hid_c_batch,
-                ), masks_batch
+                yield (
+                    obs_batch,
+                    actions_batch,
+                    values_batch,
+                    advantages_batch,
+                    returns_batch,
+                    old_actions_log_prob_batch,
+                    old_mu_batch,
+                    old_sigma_batch,
+                    (hid_a_batch, hid_c_batch),
+                    masks_batch,
+                )
 
                 first_traj = last_traj

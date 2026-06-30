@@ -13,6 +13,7 @@ import warnings
 from collections import deque
 
 import rsl_rl
+from rsl_rl.addons import AMPAddon
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, resolve_rnd_config, resolve_symmetry_config
@@ -24,8 +25,9 @@ class OnPolicyRunner:
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
         self.cfg = train_cfg
-        self.alg_cfg = train_cfg["algorithm"]
-        self.policy_cfg = train_cfg["policy"]
+        self.alg_cfg = train_cfg["algorithm"].copy()
+        self.amp_cfg = self.alg_cfg.pop("amp_cfg", None)
+        self.policy_cfg = train_cfg["policy"].copy()
         self.device = device
         self.env = env
 
@@ -45,6 +47,7 @@ class OnPolicyRunner:
 
         # create the algorithm
         self.alg = self._construct_algorithm(obs)
+        self.amp = self._construct_amp_addon(obs)
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -79,6 +82,13 @@ class OnPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # create buffers for logging task and AMP rewards
+        if self.amp:
+            task_rewbuffer = deque(maxlen=100)
+            amp_rewbuffer = deque(maxlen=100)
+            cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
@@ -90,6 +100,8 @@ class OnPolicyRunner:
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
+            if self.amp:
+                self.amp.broadcast_parameters()
 
         # Start training
         start_iter = self.current_learning_iteration
@@ -105,6 +117,11 @@ class OnPolicyRunner:
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # Compute AMP rewards before the algorithm consumes rewards
+                    task_rewards = rewards.clone()
+                    amp_rewards = None
+                    if self.amp:
+                        rewards, amp_rewards = self.amp.process_env_step(obs, rewards, dones)
                     # process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
                     # Extract intrinsic rewards (only for logging)
@@ -116,25 +133,36 @@ class OnPolicyRunner:
                         elif "log" in extras:
                             ep_infos.append(extras["log"])
                         # Update rewards
+                        if self.amp:
+                            assert amp_rewards is not None
+                            cur_task_reward_sum += task_rewards.view(-1)
+                            cur_amp_reward_sum += amp_rewards.view(-1)
                         if self.alg.rnd:
-                            cur_ereward_sum += rewards
-                            cur_ireward_sum += intrinsic_rewards  # type: ignore
-                            cur_reward_sum += rewards + intrinsic_rewards
+                            assert intrinsic_rewards is not None
+                            cur_ereward_sum += rewards.view(-1)
+                            cur_ireward_sum += intrinsic_rewards.view(-1)
+                            cur_reward_sum += rewards.view(-1) + intrinsic_rewards.view(-1)
                         else:
-                            cur_reward_sum += rewards
+                            cur_reward_sum += rewards.view(-1)
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
                         # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        new_ids = (dones.view(-1) > 0).nonzero(as_tuple=False).flatten()
+                        rewbuffer.extend(cur_reward_sum[new_ids].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
+                        # -- task and AMP rewards
+                        if self.amp:
+                            task_rewbuffer.extend(cur_task_reward_sum[new_ids].cpu().numpy().tolist())
+                            amp_rewbuffer.extend(cur_amp_reward_sum[new_ids].cpu().numpy().tolist())
+                            cur_task_reward_sum[new_ids] = 0
+                            cur_amp_reward_sum[new_ids] = 0
                         # -- intrinsic and extrinsic rewards
                         if self.alg.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            erewbuffer.extend(cur_ereward_sum[new_ids].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids].cpu().numpy().tolist())
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
@@ -147,6 +175,8 @@ class OnPolicyRunner:
 
             # update policy
             loss_dict = self.alg.update()
+            if self.amp:
+                loss_dict.update(self.amp.update())
 
             stop = time.time()
             learn_time = stop - start
@@ -210,7 +240,8 @@ class OnPolicyRunner:
 
         # -- Losses
         for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+            log_key = key if "/" in key else f"Loss/{key}"
+            self.writer.add_scalar(log_key, value, locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # -- Policy
@@ -228,6 +259,11 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+            if self.amp:
+                self.writer.add_scalar("Train/mean_task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("Train/mean_amp_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("AMP/mean_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("AMP/reward_coef", self.amp.reward_coef, locs["it"])
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -249,12 +285,18 @@ class OnPolicyRunner:
             )
             # -- Losses
             for key, value in locs["loss_dict"].items():
-                log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
+                loss_label = f"{key}:" if "/" in key else f"Mean {key} loss:"
+                log_string += f"""{loss_label:>{pad}} {value:.4f}\n"""
             # -- Rewards
             if hasattr(self.alg, "rnd") and self.alg.rnd:
                 log_string += (
                     f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
+                )
+            if self.amp:
+                log_string += (
+                    f"""{'Mean task reward:':>{pad}} {statistics.mean(locs['task_rewbuffer']):.2f}\n"""
+                    f"""{'Mean AMP reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n"""
                 )
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- episode info
@@ -298,6 +340,9 @@ class OnPolicyRunner:
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
+        # -- Save AMP model if used
+        if self.amp:
+            saved_dict["amp_state_dict"] = self.amp.state_dict()
         torch.save(saved_dict, path)
 
         # upload model to external logging service
@@ -311,6 +356,12 @@ class OnPolicyRunner:
         # -- Load RND model if used
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load AMP model if used
+        if self.amp:
+            if "amp_state_dict" in loaded_dict:
+                self.amp.load_state_dict(loaded_dict["amp_state_dict"], load_optimizer=load_optimizer)
+            else:
+                print("[Warning] AMP is enabled, but the checkpoint does not contain AMP state.")
         # -- load optimizer if used
         if load_optimizer and resumed_training:
             # -- algorithm optimizer
@@ -335,6 +386,9 @@ class OnPolicyRunner:
         # -- RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.train()
+        # -- AMP
+        if self.amp:
+            self.amp.train()
 
     def eval_mode(self):
         # -- PPO
@@ -342,6 +396,9 @@ class OnPolicyRunner:
         # -- RND
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             self.alg.rnd.eval()
+        # -- AMP
+        if self.amp:
+            self.amp.eval()
 
     def add_git_repo_to_log(self, repo_file_path):
         self.git_status_repos.append(repo_file_path)
@@ -349,6 +406,22 @@ class OnPolicyRunner:
     """
     Helper functions.
     """
+
+    def _construct_amp_addon(self, obs) -> AMPAddon | None:
+        """Construct the AMP add-on if it is configured."""
+        if self.amp_cfg is None:
+            return None
+
+        return AMPAddon(
+            self.env,
+            obs,
+            self.amp_cfg,
+            self.num_steps_per_env,
+            self.alg.num_mini_batches,
+            self.alg.num_learning_epochs,
+            device=self.device,
+            multi_gpu_cfg=self.multi_gpu_cfg,
+        )
 
     def _configure_multi_gpu(self):
         """Configure multi-gpu training."""

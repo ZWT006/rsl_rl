@@ -12,7 +12,26 @@ from rsl_rl.utils import resolve_optimizer
 
 
 class Distillation:
-    """Distillation algorithm for training a student model to mimic a teacher model."""
+    """Teacher-student behavior distillation.
+
+    Paper-to-code outline:
+        DistillationRunner.learn()
+        |-- Distillation.act()
+        |   |-- student samples a_s_t from pi_s(.|o_s_t) for environment interaction
+        |   `-- teacher computes a_T_t = pi_T(o_T_t) as the supervised target
+        |-- env.step(a_s_t)
+        |-- Distillation.process_env_step()
+        |   `-- store o_t, a_s_t, a_T_t, done_t in RolloutStorage
+        `-- Distillation.update()
+            |-- RolloutStorage.generator() yields time-major steps
+            |-- student recomputes mu_s_t = pi_s(o_s_t) with gradients
+            |-- L_BC = loss_fn(mu_s_t, a_T_t)
+            |-- accumulate gradient_length steps for truncated BPTT
+            `-- optimizer.step()
+
+    The environment is driven by the student's sampled actions, while the loss trains the student mean action to match
+    the frozen teacher action computed from the teacher observation group.
+    """
 
     policy: StudentTeacher | StudentTeacherRecurrent
     """The student teacher model."""
@@ -30,10 +49,10 @@ class Distillation:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
-        # device-related parameters
+        # Device and distributed parameters. In multi-GPU mode, each rank collects rollout samples and gradients are
+        # averaged before the student update.
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
-        # Multi-GPU parameters
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
             self.gpu_world_size = multi_gpu_cfg["world_size"]
@@ -41,7 +60,8 @@ class Distillation:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # distillation components
+        # The StudentTeacher module owns both networks. The teacher is frozen/eval; the optimizer updates the student
+        # parameters and optional action-noise parameters.
         self.policy = policy
         self.policy.to(self.device)
         self.storage = None  # initialized later
@@ -53,7 +73,8 @@ class Distillation:
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = None
 
-        # distillation parameters
+        # Distillation hyper-parameters. gradient_length controls how many time steps are accumulated before one
+        # backward pass, which is especially important for recurrent students as truncated BPTT length.
         self.num_learning_epochs = num_learning_epochs
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
@@ -72,7 +93,8 @@ class Distillation:
         self.num_updates = 0
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
-        # create rollout storage
+        # Create a distillation rollout buffer. It stores the student action used in the environment and the
+        # privileged teacher action used as the supervised target.
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -83,18 +105,22 @@ class Distillation:
         )
 
     def act(self, obs):
-        # compute the actions
+        # a_s_t drives the environment. It is sampled from the student policy so the rollout distribution matches the
+        # deployed student, not the teacher.
         self.transition.actions = self.policy.act(obs).detach()
+        # a_T_t is the frozen teacher target. The teacher may use privileged observation groups that the student does
+        # not receive.
         self.transition.privileged_actions = self.policy.evaluate(obs).detach()
-        # record the observations
+        # Store o_t before env.step(); rewards and dones arrive in process_env_step().
         self.transition.observations = obs
         return self.transition.actions
 
     def process_env_step(self, obs, rewards, dones, extras):
-        # update the normalizers
+        # Update only the student observation normalizer. The teacher normalizer is loaded with the teacher and kept in
+        # eval mode by StudentTeacher.train().
         self.policy.update_normalization(obs)
 
-        # record the rewards and dones
+        # Rewards are stored only for logging/storage consistency. The supervised loss uses a_T_t, not returns.
         self.transition.rewards = rewards
         self.transition.dones = dones
         # record the transition
@@ -103,28 +129,33 @@ class Distillation:
         self.policy.reset(dones)
 
     def update(self):
+        """Optimize the student with behavior cloning loss L_BC over the collected rollout."""
         self.num_updates += 1
         mean_behavior_loss = 0
         loss = 0
         cnt = 0
 
         for epoch in range(self.num_learning_epochs):
+            # Recurrent students continue from the hidden state saved after the previous update. Feed-forward students
+            # return None and this reset is a no-op.
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
             for obs, _, privileged_actions, dones in self.storage.generator():
 
-                # inference the student for gradient computation
+                # Recompute mu_s_t = pi_s(o_s_t) with gradients. This differs from act(), which sampled a_s_t under
+                # torch.inference_mode() during rollout.
                 actions = self.policy.act_inference(obs)
 
-                # behavior cloning loss
+                # Behavior cloning loss: L_BC = ||mu_s_t - a_T_t||^2 for mse, or Huber(mu_s_t, a_T_t).
                 behavior_loss = self.loss_fn(actions, privileged_actions)
 
-                # total loss
+                # Accumulate losses across gradient_length time steps before a backward pass. This gives recurrent
+                # students a truncated BPTT window and gives feed-forward students a larger effective batch.
                 loss = loss + behavior_loss
                 mean_behavior_loss += behavior_loss.item()
                 cnt += 1
 
-                # gradient step
+                # Gradient step for the accumulated L_BC window.
                 if cnt % self.gradient_length == 0:
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -136,7 +167,8 @@ class Distillation:
                     self.policy.detach_hidden_states()
                     loss = 0
 
-                # reset dones
+                # Reset recurrent hidden states at episode boundaries and detach them to stop gradients crossing
+                # completed episodes.
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))
 

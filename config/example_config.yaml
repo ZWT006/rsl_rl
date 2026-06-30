@@ -47,6 +47,25 @@ runner:
     # -- miscellaneous
     normalize_advantage_per_mini_batch: false
 
+    # -- adversarial motion prior
+    amp_cfg: null
+    # amp_cfg:
+    #   obs_key: amp  # environment observation key for policy-side AMP states
+    #   expert_sampler_name: get_amp_expert_obs  # env method returning expert AMP states
+    #   reward_coef: 0.35
+    #   reward_combine: add  # add, blend
+    #   reward_type: quad  # quad, log, wasserstein
+    #   discriminator:
+    #     hidden_dims: [512, 256]
+    #     activation: relu
+    #     loss_type: mse  # mse, bce, wasserstein
+    #     learning_rate: 0.0001
+    #     gradient_penalty_coef: 5.0
+    #     # optional engineering regularizers, not part of the AMP paper Eq. 8 baseline
+    #     weight_decay_coef: 0.0
+    #     logit_weight_decay_coef: 0.0
+    #     normalize_input: false
+
     # -- random network distillation
     rnd_cfg:
         weight: 0.0  # initial weight of the RND reward

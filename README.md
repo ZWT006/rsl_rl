@@ -10,9 +10,12 @@ Environment repositories using the framework:
 
 The main branch supports **PPO** and **Student-Teacher Distillation** with additional features from our research. These include:
 
-* [Random Network Distillation (RND)](https://proceedings.mlr.press/v229/schwarke23a.html) - Encourages exploration by adding
-  a curiosity driven intrinsic reward.
-* [Symmetry-based Augmentation](https://arxiv.org/abs/2403.04359) - Makes the learned behaviors more symmetrical.
+**Algorithms** 
+* [Random Network Distillation (RND)](https://proceedings.mlr.press/v229/schwarke23a.html) - Encourages exploration by adding a curiosity driven intrinsic reward. `=>` [DISTILLATION Doc](/rsl_rl/algorithms/DISTILLATION.md)
+* [Symmetry-based Augmentation](https://arxiv.org/abs/2403.04359) - Makes the learned behaviors more symmetrical.  `=>` [PPO Doc](/rsl_rl/algorithms/PPO.md)
+
+**Addon Features**
+* [Adversarial Motion Priors](https://arxiv.org/pdf/2104.02180) - Benefit stylized physics-based character control.  `=>` [AMP Doc](/rsl_rl/addons/AMP.md)  
 
 We welcome contributions from the community. Please check our contribution guidelines for more
 information.

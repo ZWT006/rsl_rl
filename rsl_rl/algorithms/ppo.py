@@ -17,7 +17,30 @@ from rsl_rl.utils import string_to_callable
 
 
 class PPO:
-    """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
+    """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347).
+
+    Paper-to-code outline:
+        OnPolicyRunner.learn()
+        |-- PPO.act()
+        |   |-- sample a_t from pi_old(.|s_t)
+        |   `-- store logp_old_t, V_old_t, mu_old_t, sigma_old_t
+        |-- env.step(a_t)
+        |   `-- returns r_t, done_t, and s_{t+1}
+        |-- PPO.process_env_step()
+        |   `-- store transition and optional RND/time-limit reward adjustments
+        |-- PPO.compute_returns()
+        |   `-- RolloutStorage.compute_returns()      # GAE: delta_t, A_t, R_t
+        `-- PPO.update()
+            |-- recompute logp_theta_t, V_theta_t, entropy H_t
+            |-- rho_t = exp(logp_theta_t - logp_old_t)
+            |-- surrogate_loss                        # negative clipped PPO objective
+            |-- value_loss                            # clipped or unclipped critic regression
+            |-- optional symmetry/RND losses
+            `-- optimizer.step()
+
+    rsl_rl keeps PPO as the owner of actor-critic updates. Add-ons such as AMP may shape rewards before
+    process_env_step(), but PPO still receives a single scalar reward stream.
+    """
 
     policy: ActorCritic
     """The actor critic module."""
@@ -46,10 +69,10 @@ class PPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
-        # device-related parameters
+        # Device and distributed parameters. In multi-GPU mode each rank collects its own rollout shard, then gradients
+        # are averaged so all ranks apply the same PPO update.
         self.device = device
         self.is_multi_gpu = multi_gpu_cfg is not None
-        # Multi-GPU parameters
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
             self.gpu_world_size = multi_gpu_cfg["world_size"]
@@ -57,7 +80,8 @@ class PPO:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
 
-        # RND components
+        # Random Network Distillation (RND) adds an intrinsic reward for novelty. The target network is fixed, while
+        # the predictor learns to match it; high prediction error becomes exploration reward.
         if rnd_cfg is not None:
             # Extract parameters used in ppo
             rnd_lr = rnd_cfg.pop("learning_rate", 1e-3)
@@ -70,7 +94,8 @@ class PPO:
             self.rnd = None
             self.rnd_optimizer = None
 
-        # Symmetry components
+        # Symmetry can be used in two ways: data augmentation expands PPO mini-batches with mirrored samples, while
+        # mirror loss directly regularizes the actor mean to be equivariant under the provided transform.
         if symmetry_cfg is not None:
             # Check if symmetry is enabled
             use_symmetry = symmetry_cfg["use_data_augmentation"] or symmetry_cfg["use_mirror_loss"]
@@ -91,7 +116,8 @@ class PPO:
         else:
             self.symmetry = None
 
-        # PPO components
+        # PPO owns the actor-critic optimizer and rollout transition object. The storage is created later because the
+        # runner provides the exact observation/action shapes after the environment is constructed.
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
@@ -100,7 +126,7 @@ class PPO:
         self.storage: RolloutStorage = None  # type: ignore
         self.transition = RolloutStorage.Transition()
 
-        # PPO parameters
+        # PPO hyper-parameters. clip_param is eps_clip in the clipped objective; gamma and lam are used by GAE.
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
@@ -116,7 +142,7 @@ class PPO:
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
 
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape):
-        # create rollout storage
+        # Create the on-policy buffer. PPO reuses each rollout for several mini-batch epochs, then clears it.
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -129,18 +155,20 @@ class PPO:
     def act(self, obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
-        # compute the actions and values
+        # Sample a_t from pi_old and snapshot everything needed to compute rho_t later:
+        # log pi_old(a_t|s_t), V_old(s_t), and the old Gaussian parameters for KL diagnostics.
         self.transition.actions = self.policy.act(obs).detach()
         self.transition.values = self.policy.evaluate(obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
-        # need to record obs before env.step()
+        # Record s_t before env.step(); rewards and dones for this transition arrive in process_env_step().
         self.transition.observations = obs
         return self.transition.actions
 
     def process_env_step(self, obs, rewards, dones, extras):
-        # update the normalizers
+        # Update observation normalizers with the next observation stream. This keeps actor, critic, and optional RND
+        # preprocessing synchronized with what the environment is currently producing.
         self.policy.update_normalization(obs)
         if self.rnd:
             self.rnd.update_normalization(obs)
@@ -150,14 +178,15 @@ class PPO:
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
-        # Compute the intrinsic rewards and add to extrinsic rewards
+        # RND intrinsic reward is added before GAE, so advantages are computed from the combined reward signal.
         if self.rnd:
             # Compute the intrinsic rewards
             self.intrinsic_rewards = self.rnd.get_intrinsic_reward(obs)
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
-        # Bootstrapping on time outs
+        # Time-limit truncations are not true terminal states. Add gamma * V_old_t so return estimation bootstraps
+        # through the artificial timeout instead of treating it as zero future value.
         if "time_outs" in extras:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device), 1
@@ -169,7 +198,7 @@ class PPO:
         self.policy.reset(dones)
 
     def compute_returns(self, obs):
-        # compute value for the last step
+        # Bootstrap the final state value and let RolloutStorage compute GAE-lambda returns and advantages.
         last_values = self.policy.evaluate(obs).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
@@ -190,7 +219,8 @@ class PPO:
         else:
             mean_symmetry_loss = None
 
-        # generator for mini batches
+        # rsl_rl supports both feed-forward PPO batches and recurrent batches that preserve padded trajectories and
+        # masks. In both cases, the generator yields samples from the fixed pi_old rollout.
         if self.policy.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
@@ -210,19 +240,21 @@ class PPO:
             masks_batch,
         ) in generator:
 
-            # number of augmentations per sample
-            # we start with 1 and increase it if we use symmetry augmentation
+            # Number of augmentations per sample. It starts at 1 and increases when symmetry data augmentation expands
+            # the policy batch.
             num_aug = 1
             # original batch size
             # we assume policy group is always there and needs augmentation
             original_batch_size = obs_batch.batch_size[0]
 
-            # check if we should normalize advantages per mini batch
+            # Advantage normalization reduces gradient scale sensitivity. It can be done once globally in storage or
+            # here per mini-batch; doing both would change the intended normalization statistics.
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1e-8)
 
-            # Perform symmetric augmentation
+            # Symmetry data augmentation mirrors observations/actions and repeats old-policy targets. The PPO ratio
+            # still compares current log-probabilities to the stored old log-probabilities for each augmented sample.
             if self.symmetry and self.symmetry["use_data_augmentation"]:
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
@@ -243,8 +275,8 @@ class PPO:
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: we need to do this because we updated the policy with the new parameters
+            # Recompute logp_theta_t = log pi_theta(a_t|s_t), V_theta_t, and entropy with current parameters. This is
+            # makes PPO an off-policy-looking update over on-policy data: the denominator stays fixed at pi_old.
             # -- actor
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
@@ -256,7 +288,8 @@ class PPO:
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
 
-            # KL
+            # Adaptive KL schedule. For diagonal Gaussian policies, this computes KL(pi_old || pi_theta). If the update
+            # moves too far from pi_old, reduce the learning rate; if it is too conservative, increase it.
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = torch.sum(
@@ -293,7 +326,9 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
+            # Clipped PPO surrogate. The paper maximizes min(rho_t * A_t, clip(rho_t, 1 - eps, 1 + eps) * A_t).
+            # This implementation minimizes the negative objective, so max(-rho_t*A_t, -clip(rho_t)*A_t) is
+            # equivalent.
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
@@ -301,7 +336,8 @@ class PPO:
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # Value function loss
+            # Critic regression to the bootstrapped return R_t. Clipped value loss mirrors the policy clipping idea:
+            # keep V_theta from moving more than eps away from V_old when that would improve the loss too aggressively.
             if self.use_clipped_value_loss:
                 value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
                     -self.clip_param, self.clip_param
@@ -312,6 +348,7 @@ class PPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            # Entropy is subtracted because we minimize the loss; this rewards higher-entropy action distributions.
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # Symmetry loss
@@ -347,7 +384,8 @@ class PPO:
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # Random Network Distillation loss
+            # Random Network Distillation loss trains only the predictor. Its current prediction error was already
+            # used as intrinsic reward during rollout; this supervised loss makes familiar states less novel later.
             # TODO: Move this processing to inside RND module.
             if self.rnd:
                 # extract the rnd_state
@@ -362,7 +400,7 @@ class PPO:
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
-            # Compute the gradients
+            # Compute gradients for the actor-critic objective and, if enabled, the separate RND predictor objective.
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
@@ -371,11 +409,11 @@ class PPO:
                 self.rnd_optimizer.zero_grad()  # type: ignore
                 rnd_loss.backward()
 
-            # Collect gradients from all GPUs
+            # Collect gradients from all GPUs before clipping/stepping so every rank applies the same update.
             if self.is_multi_gpu:
                 self.reduce_parameters()
 
-            # Apply the gradients
+            # Clip the global actor-critic gradient norm, a common PPO stabilizer for large locomotion batches.
             # -- For PPO
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()

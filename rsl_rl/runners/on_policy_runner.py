@@ -108,6 +108,9 @@ class OnPolicyRunner:
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            if self.amp:
+                amp_step_reward_sum = torch.zeros((), dtype=torch.float, device=self.device)
+                amp_step_reward_count = 0
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
@@ -137,6 +140,8 @@ class OnPolicyRunner:
                             assert amp_rewards is not None
                             cur_task_reward_sum += task_rewards.view(-1)
                             cur_amp_reward_sum += amp_rewards.view(-1)
+                            amp_step_reward_sum += amp_rewards.sum()
+                            amp_step_reward_count += amp_rewards.numel()
                         if self.alg.rnd:
                             assert intrinsic_rewards is not None
                             cur_ereward_sum += rewards.view(-1)
@@ -260,9 +265,15 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             if self.amp:
+                # These buffers store completed-episode sums. Train/mean_amp_reward logs the reward_coef-scaled
+                # AMP term in the PPO reward, while AMP/mean_episode_reward keeps the raw AMP diagnostic value.
+                mean_amp_episode_reward = statistics.mean(locs["amp_rewbuffer"])
+                mean_amp_reward_contribution = self.amp.reward_coef * mean_amp_episode_reward
+                mean_amp_step_reward = (locs["amp_step_reward_sum"] / locs["amp_step_reward_count"]).item()
                 self.writer.add_scalar("Train/mean_task_reward", statistics.mean(locs["task_rewbuffer"]), locs["it"])
-                self.writer.add_scalar("Train/mean_amp_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
-                self.writer.add_scalar("AMP/mean_reward", statistics.mean(locs["amp_rewbuffer"]), locs["it"])
+                self.writer.add_scalar("Train/mean_amp_reward", mean_amp_reward_contribution, locs["it"])
+                self.writer.add_scalar("AMP/mean_episode_reward", mean_amp_episode_reward, locs["it"])
+                self.writer.add_scalar("AMP/mean_step_reward", mean_amp_step_reward, locs["it"])
                 self.writer.add_scalar("AMP/reward_coef", self.amp.reward_coef, locs["it"])
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
@@ -294,9 +305,14 @@ class OnPolicyRunner:
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
                 )
             if self.amp:
+                mean_amp_episode_reward = statistics.mean(locs["amp_rewbuffer"])
+                mean_amp_reward_contribution = self.amp.reward_coef * mean_amp_episode_reward
+                mean_amp_step_reward = (locs["amp_step_reward_sum"] / locs["amp_step_reward_count"]).item()
                 log_string += (
                     f"""{'Mean task reward:':>{pad}} {statistics.mean(locs['task_rewbuffer']):.2f}\n"""
-                    f"""{'Mean AMP reward:':>{pad}} {statistics.mean(locs['amp_rewbuffer']):.2f}\n"""
+                    f"""{'Mean AMP contribution:':>{pad}} {mean_amp_reward_contribution:.2f}\n"""
+                    f"""{'Mean AMP raw episode reward:':>{pad}} {mean_amp_episode_reward:.2f}\n"""
+                    f"""{'Mean AMP step reward:':>{pad}} {mean_amp_step_reward:.4f}\n"""
                 )
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
             # -- episode info

@@ -76,14 +76,14 @@ format. If your VSCode build opens the file but ignores the line anchor, use Qui
 - [AMPAddon](./amp.py#L19)
 - [AMPAddon.process_env_step](./amp.py#L136)
 - [AMPAddon.compute_rewards](./amp.py#L152)
-- [AMPAddon.combine_rewards](./amp.py#L175)
+- [AMPAddon.combine_rewards](./amp.py#L176)
 - [PPO.update](../algorithms/ppo.py#L200)
-- [AMPAddon.update](./amp.py#L184)
+- [AMPAddon.update](./amp.py#L185)
 - [AMPStorage.add_transitions](../storage/amp_storage.py#L47)
 - [AMPStorage.mini_batch_generator](../storage/amp_storage.py#L59)
-- [AMPAddon._sample_expert_observations](./amp.py#L320)
-- [AMPAddon._compute_discriminator_loss](./amp.py#L331)
-- [AMPAddon._compute_gradient_penalty](./amp.py#L357)
+- [AMPAddon._sample_expert_observations](./amp.py#L324)
+- [AMPAddon._compute_discriminator_loss](./amp.py#L335)
+- [AMPAddon._compute_gradient_penalty](./amp.py#L362)
 - [AMPDiscriminator.forward](../modules/amp.py#L52)
 
 ## Symbols
@@ -178,6 +178,44 @@ $$
 
 The reward is computed under `torch.no_grad()`: PPO receives a scalar reward and does not backpropagate through `D`.
 
+## Logging Notes
+
+For `reward_type: quad`, the raw per-step style reward is bounded:
+
+$$
+0 \le r^S_t \le 1
+$$
+
+The runner logs three AMP reward views:
+
+| Log key | Meaning |
+| --- | --- |
+| `AMP/mean_step_reward` | Raw per-step style reward averaged over the current rollout. |
+| `AMP/mean_episode_reward` | Raw completed-episode AMP reward sum. |
+| `Train/mean_amp_reward` | `reward_coef`-scaled AMP episode contribution used in the PPO reward. |
+
+`AMP/mean_episode_reward` is the mean completed-episode sum stored in `amp_rewbuffer`:
+
+$$
+\texttt{AMP/mean\_episode\_reward}
+\approx
+\mathbb{E}_{\text{episodes}}
+\left[\sum_t r^S_t\right]
+$$
+
+`Train/mean_amp_reward` is scaled for comparison with `Train/mean_task_reward`:
+
+$$
+\texttt{Train/mean\_amp\_reward}
+\approx
+\texttt{reward\_coef}\ 
+\mathbb{E}_{\text{episodes}}
+\left[\sum_t r^S_t\right]
+$$
+
+Therefore the raw episode AMP reward can be larger than `1` when episodes contain multiple steps, while
+`AMP/mean_step_reward` remains the direct per-step diagnostic for `reward_type: quad`.
+
 ## Eq. 4: Reward Mixing
 
 The AMP paper combines task and style reward:
@@ -198,7 +236,7 @@ Code:
 return task_rewards + self.reward_coef * amp_rewards
 ```
 
-See [AMPAddon.combine_rewards](./amp.py#L175).
+See [AMPAddon.combine_rewards](./amp.py#L176).
 
 After this point, PPO computes returns and advantages from `r_t`, not from `r_G_t` alone.
 
@@ -226,7 +264,7 @@ During the discriminator update, expert/reference AMP features are sampled from 
 expert_obs = self.expert_sampler(batch_size)
 ```
 
-See [AMPAddon._sample_expert_observations](./amp.py#L320).
+See [AMPAddon._sample_expert_observations](./amp.py#L324).
 
 The environment must provide:
 
@@ -270,7 +308,7 @@ expert_loss = mse_loss(expert_logits, +ones)
 discriminator_loss = 0.5 * (policy_loss + expert_loss)
 ```
 
-See [AMPAddon._compute_discriminator_loss](./amp.py#L331).
+See [AMPAddon._compute_discriminator_loss](./amp.py#L335).
 
 The `0.5` factor is only a scale convention. It does not change the optimum of the discriminator objective.
 
@@ -293,7 +331,7 @@ grad = torch.autograd.grad(outputs=expert_logits, inputs=expert_obs, ...)[0]
 gradient_penalty = grad.norm(2, dim=-1).pow(2).mean()
 ```
 
-See [AMPAddon._compute_gradient_penalty](./amp.py#L357).
+See [AMPAddon._compute_gradient_penalty](./amp.py#L362).
 
 This implementation also supports `gradient_penalty_tolerance`:
 
@@ -333,7 +371,7 @@ L_{\text{total}} =
 \end{aligned}
 $$
 
-See [AMPAddon.update](./amp.py#L184).
+See [AMPAddon.update](./amp.py#L185).
 
 For the paper-aligned baseline, use:
 
@@ -348,8 +386,8 @@ logit_weight_decay_coef: 0.0
 
 These two losses are not part of the AMP paper Eq. 8 baseline:
 
-- [AMPAddon._compute_weight_decay](./amp.py#L377)
-- [AMPAddon._compute_logit_weight_decay](./amp.py#L387)
+- [AMPAddon._compute_weight_decay](./amp.py#L382)
+- [AMPAddon._compute_logit_weight_decay](./amp.py#L392)
 
 They are reference-implementation style stabilizers:
 

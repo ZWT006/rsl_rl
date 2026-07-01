@@ -126,8 +126,8 @@ See [on_policy_runner.py](../runners/on_policy_runner.py#L117).
 At this point:
 
 $$
-\texttt{rewards} = r^G_t,\qquad
-\texttt{obs["amp"]} = \phi_\pi = (\Phi(s_t), \Phi(s_{t+1}))
+\mathrm{rewards} = r^G_t,\qquad
+\phi_\pi = (\Phi(s_t), \Phi(s_{t+1}))
 $$
 
 Then the runner calls AMP before PPO stores the transition:
@@ -197,7 +197,7 @@ The runner logs three AMP reward views:
 `AMP/mean_episode_reward` is the mean completed-episode sum stored in `amp_rewbuffer`:
 
 $$
-\texttt{AMP/mean\_episode\_reward}
+\bar{r}^{S}_{\mathrm{episode}}
 \approx
 \mathbb{E}_{\text{episodes}}
 \left[\sum_t r^S_t\right]
@@ -206,12 +206,14 @@ $$
 `Train/mean_amp_reward` is scaled for comparison with `Train/mean_task_reward`:
 
 $$
-\texttt{Train/mean\_amp\_reward}
+\bar{r}^{S}_{\mathrm{train}}
 \approx
-\texttt{reward\_coef}\ 
+c_S
 \mathbb{E}_{\text{episodes}}
 \left[\sum_t r^S_t\right]
 $$
+
+Here $c_S$ is the code value `reward_coef`.
 
 Therefore the raw episode AMP reward can be larger than `1` when episodes contain multiple steps, while
 `AMP/mean_step_reward` remains the direct per-step diagnostic for `reward_type: quad`.
@@ -227,8 +229,10 @@ $$
 The add-on default is the common simplified form:
 
 $$
-r_t = r^G_t + \texttt{reward\_coef}\ r^S_t
+r_t = r^G_t + c_S r^S_t
 $$
+
+Here $c_S$ is the code value `reward_coef`.
 
 Code:
 
@@ -339,11 +343,12 @@ $$
 L_{GP} =
 \mathbb{E}_{\phi_M \sim d^M}
 \left[
-\max\left(\left\|\nabla_{\phi_M}D(\phi_M)\right\|_2 - \texttt{tolerance}, 0\right)^2
+\max\left(\left\|\nabla_{\phi_M}D(\phi_M)\right\|_2 - \tau, 0\right)^2
 \right]
 $$
 
-With `tolerance = 0.0`, this reduces to the paper-style squared gradient norm.
+Here $\tau$ is the code value `gradient_penalty_tolerance`. With `gradient_penalty_tolerance = 0.0`, this reduces
+to the paper-style squared gradient norm.
 
 Coefficient note:
 
@@ -352,10 +357,11 @@ $$
 $$
 
 $$
-\text{code coefficient: } \texttt{gradient\_penalty\_coef}\ L_{GP}
+\text{code coefficient: } c_{GP} L_{GP}
 $$
 
-So a paper value $w_{gp}=10$ corresponds to `gradient_penalty_coef = 5.0`.
+Here $c_{GP}$ is the code value `gradient_penalty_coef`. A paper value $w_{gp}=10$ corresponds to
+`gradient_penalty_coef = 5.0`.
 
 ## Total Discriminator Loss In This Add-on
 
@@ -363,13 +369,14 @@ The code builds the final discriminator loss as:
 
 $$
 \begin{aligned}
-L_{\text{total}} =
-&\ \texttt{loss\_coef}\ L_D
-+ \texttt{gradient\_penalty\_coef}\ L_{GP} \\
-&+ \texttt{weight\_decay\_coef}\ L_{\text{wd}}
-+ \texttt{logit\_weight\_decay\_coef}\ L_{\text{logit-wd}}
+L_{\mathrm{total}}
+&= c_{\mathrm{loss}} L_D + c_{GP} L_{GP} \\
+&\quad + c_{\mathrm{wd}} L_{\mathrm{wd}} + c_{\mathrm{logitWd}} L_{\mathrm{logitWd}}
 \end{aligned}
 $$
+
+These coefficients correspond to `loss_coef`, `gradient_penalty_coef`, `weight_decay_coef`, and
+`logit_weight_decay_coef`.
 
 See [AMPAddon.update](./amp.py#L185).
 

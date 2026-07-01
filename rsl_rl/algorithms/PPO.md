@@ -167,8 +167,8 @@ L_{\text{clip}} =
 \mathbb{E}_t
 \left[
 \max\left(
--\rho_t A_t,
--\mathrm{clip}(\rho_t, 1-\epsilon, 1+\epsilon) A_t
+{}-\rho_t A_t,
+{}-\mathrm{clip}(\rho_t, 1-\epsilon, 1+\epsilon) A_t
 \right)
 \right]
 $$
@@ -195,10 +195,7 @@ mini-batch.
 The actor-critic loss in rsl_rl is:
 
 $$
-L_{\text{total}} =
-L_{\text{clip}}
-+ c_v L_V
-- c_H H_t
+L_{\mathrm{total}} = L_{\mathrm{clip}} + c_v L_V - c_H H_t
 $$
 
 Code:
@@ -220,4 +217,3 @@ Optional terms can be added:
 3. `normalize_advantage_per_mini_batch` chooses whether advantage normalization happens globally in storage or locally
    inside each mini-batch.
 4. Multi-GPU training averages gradients in [PPO.reduce_parameters](./ppo.py#L479) before the optimizer step.
-
